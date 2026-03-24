@@ -47,6 +47,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
+from vllm_metal.paged_attention_backend.protocol import PagedAttentionBackend
 from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
@@ -71,6 +72,10 @@ _model_cache_lock = Lock()
 # Configuration for batched operations
 _MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
 _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
+
+# MLA default rope head dim (GLM/DeepSeek lineage; used when qk_rope_head_dim
+# is absent from model config).
+_MLA_DEFAULT_QK_ROPE_HEAD_DIM = 64
 
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
@@ -657,7 +662,7 @@ class MetalModelRunner:
             self._prefix_cache = PrefixCacheManager()
 
         # Paged attention state (set by worker when enabled)
-        self._paged_kv_cache: Any = None  # MetalPagedKVCache, set by worker
+        self._paged_attention_backend: PagedAttentionBackend | None = None
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
@@ -666,6 +671,16 @@ class MetalModelRunner:
     def is_stt(self) -> bool:
         """Whether the loaded model is a Speech-to-Text model."""
         return self._is_stt
+
+    @property
+    def is_mla(self) -> bool:
+        """Whether the model uses Multi-head Latent Attention (MLA).
+
+        MLA models (GLM/DeepSeek lineage) have no q_proj/k_proj/v_proj and
+        cannot use the standard Metal kernel. Worker uses this to select the
+        appropriate paged attention backend for PR2.
+        """
+        return "kv_lora_rank" in self.model_args
 
     def should_setup_paged_attention(self) -> bool:
         """Whether worker-side paged-attention setup should run.
@@ -685,7 +700,7 @@ class MetalModelRunner:
         """
         if self._is_stt:
             return "stt_nominal"
-        if paged_attention_enabled and self._paged_kv_cache is not None:
+        if paged_attention_enabled and self._paged_attention_backend is not None:
             return "paged_attention_capacity"
         return "single_sequence_estimate"
 
@@ -891,6 +906,16 @@ class MetalModelRunner:
         self.hidden_size = hidden_size
         self.head_dim: int = int(head_dim)
 
+        # MLA (GLM/DeepSeek lineage): cache stores a joint latent vector per
+        # layer, not per-head K/V. One virtual head sized kv_lora_rank +
+        # qk_rope_head_dim keeps get_cache_block_size_bytes() correct without
+        # MLA-specific logic in the sizing path.
+        if self.is_mla:
+            self.num_kv_heads = 1
+            self.head_dim = int(args["kv_lora_rank"]) + int(
+                args.get("qk_rope_head_dim", _MLA_DEFAULT_QK_ROPE_HEAD_DIM)
+            )
+
     def _extract_logits(self, model_output: Any) -> mx.array:
         """Extract logits from model output.
 
@@ -1017,63 +1042,8 @@ class MetalModelRunner:
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
-        # Paged attention kernel warm-up: load kernel + smoke-test Metal ops
-        if hasattr(self, "_paged_kv_cache") and self._paged_kv_cache is not None:
-            self._warm_up_paged_attention_kernel()
-
-    def _warm_up_paged_attention_kernel(self) -> None:
-        """JIT-compile vendored Metal shaders and verify ops work.
-
-        Calls ``get_ops()`` which triggers JIT build of the C++ nanobind
-        extension + Metal shader compilation via MLX's device.get_library().
-        Then runs a single-token ``reshape_and_cache`` smoke test against
-        layer 0 of the already-allocated cache.
-        """
-        import platform
-
-        from vllm_metal.metal import get_ops
-
-        cache = self._paged_kv_cache
-
-        logger.info("Warming up paged attention Metal kernel...")
-
-        try:
-            ops = get_ops()
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to build/load native paged-attention Metal kernel: {e}. "
-                f"macOS version: {platform.mac_ver()[0]}"
-            ) from e
-
-        # Smoke-test: single-token reshape_and_cache on layer 0
-        try:
-            dummy_k = mx.zeros(
-                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
-            )
-            dummy_v = mx.zeros(
-                (1, cache.num_kv_heads, cache.head_dim), dtype=cache.dtype
-            )
-            dummy_slot = mx.zeros((1,), dtype=mx.int64)
-            mx.eval(dummy_k, dummy_v, dummy_slot)
-
-            ops.reshape_and_cache(
-                dummy_k,
-                dummy_v,
-                cache.key_caches[0],
-                cache.value_caches[0],
-                dummy_slot,
-            )
-            mx.eval(cache.key_caches[0])
-            logger.info("Paged attention Metal kernel warm-up complete")
-        except RuntimeError as e:
-            mac_ver = platform.mac_ver()[0]
-            if "language version" in str(e):
-                raise RuntimeError(
-                    f"Metal kernel incompatible with this OS (macOS {mac_ver}). "
-                    f"The kernel requires a newer Metal language version than "
-                    f"this OS supports. Original error: {e}"
-                ) from e
-            raise
+        if self._paged_attention_backend is not None:
+            self._paged_attention_backend.warm_up()
 
     def _make_sampling_metadata(
         self,
@@ -1677,7 +1647,7 @@ class MetalModelRunner:
 
             generator = _create_request_generator(self.device, sampling_params)
 
-            if self._paged_kv_cache is not None:
+            if self._paged_attention_backend is not None:
                 sched_block_ids = list(new_req.block_ids[0])
                 scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
                 computed_tokens = new_req.num_computed_tokens
@@ -1735,7 +1705,7 @@ class MetalModelRunner:
         decode_req_ids = list(cached_reqs.req_ids)
 
         if decode_req_ids:
-            if self._paged_kv_cache is not None:
+            if self._paged_attention_backend is not None:
                 req_id_to_cached_idx = {
                     rid: i for i, rid in enumerate(cached_reqs.req_ids)
                 }
