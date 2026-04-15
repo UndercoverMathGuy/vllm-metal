@@ -72,8 +72,6 @@ from vllm_metal.v1.sampling_batch import (
 
 logger = init_logger(__name__)
 
-# Performance tuning
-_CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
@@ -240,9 +238,6 @@ class MetalModelRunner:
             custom_logitsprocs,
         )
 
-        # Track finished requests for lazy cache clearing
-        self._finished_request_count = 0
-
         # vLLM v1 async scheduling calls sample_tokens after execute_model.
         # Keep the latest execution output so sample_tokens can return it.
         self._pending_output: ModelRunnerOutput | None = None
@@ -313,14 +308,6 @@ class MetalModelRunner:
             self.model_args.get("qk_rope_head_dim", MLA_DEFAULT_QK_ROPE_HEAD_DIM)
         )
 
-    def should_setup_paged_attention(self) -> bool:
-        """Whether worker-side paged-attention setup should run.
-
-        STT models own their runtime path and do not use the paged-attention
-        cache path that the text/VLM runner uses.
-        """
-        return not self._is_stt
-
     def validate_paged_attention_support(self) -> None:
         """Validate that the loaded model can run on the paged-attention path."""
         self._model_adapter.require_uniform_kv_heads(self.model_args, self.num_kv_heads)
@@ -335,7 +322,7 @@ class MetalModelRunner:
         """
         if self._is_stt:
             return "stt_nominal"
-        if paged_attention_enabled and self._paged_attention_backend is not None:
+        if paged_attention_enabled:
             return "paged_attention_capacity"
         return "single_sequence_estimate"
 
@@ -546,6 +533,23 @@ class MetalModelRunner:
             * recurrent_dtype_size
         )
         return self.num_linear_layers * (conv_bytes + recurrent_bytes)
+
+    def profile_run(self) -> int:
+        """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
+
+        Called from ``MetalWorker.determine_available_memory`` before KV cache
+        sizing so the measured overhead replaces the historical 800 MB
+        placeholder. ``mx.set_cache_limit`` prevents unbounded buffer-cache
+        growth during serving (issue #234).
+        """
+        warmup_len = self.scheduler_config.max_num_batched_tokens
+        mx.clear_cache()
+        cache_before = mx.get_cache_memory()
+        dummy_tokens = mx.zeros((1, warmup_len), dtype=mx.int32)
+        mx.eval(self._extract_logits(self._forward_model(dummy_tokens)))
+        overhead = mx.get_cache_memory() - cache_before
+        mx.set_cache_limit(overhead)
+        return overhead
 
     def warm_up(self) -> None:
         """Warm up the model with a dummy forward pass.
@@ -1262,7 +1266,7 @@ class MetalModelRunner:
         self,
         finished_req_ids: set[str],
     ) -> None:
-        """Evict finished request state and periodically clear MLX cache."""
+        """Evict runner-owned state for finished requests."""
         if not finished_req_ids:
             self._gdn_materialize_pending_state_cache()
             return
@@ -1279,29 +1283,6 @@ class MetalModelRunner:
 
         self._gdn_release_slots(finished_req_ids)
         self._gdn_materialize_pending_state_cache()
-
-        self._finished_request_count += len(finished_req_ids)
-        if self._finished_request_count < _CACHE_CLEAR_INTERVAL:
-            return
-
-        mx.clear_cache()
-        self._finished_request_count = 0
-
-        if self._prefix_cache is None:
-            return
-
-        stats = self._prefix_cache.get_stats()
-        logger.info(
-            "Prefix cache: %.1f%% hit rate "
-            "(hits=%d, misses=%d, cached=%d, "
-            "%.1fMB/%.1fMB)",
-            stats["hit_rate"] * 100,
-            stats["hits"],
-            stats["misses"],
-            stats["cached_entries"],
-            stats["current_bytes"] / (1024 * 1024),
-            stats["max_bytes"] / (1024 * 1024),
-        )
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
