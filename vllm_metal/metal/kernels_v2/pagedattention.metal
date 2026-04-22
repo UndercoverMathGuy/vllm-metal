@@ -981,11 +981,11 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
   threadgroup float *warp_scores =
       reinterpret_cast<threadgroup float *>(shared_mem) +
       warp_idx * BLOCK_SIZE;
-  // TurboQuant: per-warp FWHT workspace for V dequantization.
-  // Allocated after warp_scores. Host must provide the extra shmem when use_turboquant.
-  threadgroup float *fwht_buf =
-      reinterpret_cast<threadgroup float *>(shared_mem) +
-      NUM_WARPS * BLOCK_SIZE + warp_idx * HEAD_SIZE;
+  // NOTE: the previous fwht_buf per-warp workspace (NUM_WARPS * HEAD_SIZE
+  // floats) has been removed — the TurboQuant V dequant path now runs
+  // register-only via `tq_load_and_accumulate_v` + `inverse_fwht_in_place`,
+  // so no threadgroup memory is needed for V reconstruction.  The host-side
+  // shmem-size calculation in paged_ops.cpp no longer adds the TQ bonus.
 
   const device uint32_t *block_table =
       block_tables + seq_idx * max_num_blocks_per_seq;
@@ -1136,7 +1136,7 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
             tok * (num_kv_heads * SCALE_GROUPS) +
             kv_head_idx * SCALE_GROUPS;
         tq_load_and_accumulate_v<HEAD_SIZE, NUM_SIMD_LANES>(
-            v_accs, fwht_buf, v_ptr, value_scale_cache, v_scale_base_offset, w, lane,
+            v_accs, v_ptr, value_scale_cache, v_scale_base_offset, w, lane,
             v_centroids, v_bits);
       } else {
         const device V_CACHE_T *v_ptr =
@@ -1256,6 +1256,22 @@ template <typename T, typename K_CACHE_T, typename V_CACHE_T, int HEAD_SIZE, int
                                    q_token_idx * num_heads * max_num_partitions +
                                    head_idx * max_num_partitions + partition_idx;
       *exp_sums_ptr = warp_l;
+    }
+
+    // TurboQuant V: we've been accumulating in the rotated (FWHT) domain
+    // the whole block loop.  Apply inverse FWHT ONCE here, to the merged
+    // per-head output, before the final normalise + write.  This replaces
+    // O(ctx) per-token FWHTs with exactly one FWHT per head per kernel
+    // dispatch — the difference between a tight short-ctx kernel and a
+    // long-ctx kernel that scales linearly with token count.
+    //
+    // Guarded by the `use_turboquant` function constant so the non-TQ
+    // specialisation compiles this away completely.  Safe across all 32
+    // lanes of warp 0 (simd_shuffle_xor requires full-warp participation).
+    // For partitioned mode, applying the FWHT to each partition's output
+    // is still correct by linearity of the reduce kernel's weighted sum.
+    if (use_turboquant) {
+      inverse_fwht_in_place<HEAD_SIZE>(v_accs, lane);
     }
 
     // Final normalization: O = O / l
