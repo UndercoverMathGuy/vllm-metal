@@ -28,7 +28,9 @@ classifiers = [
 
 dependencies = [
     # MLX - Required for Apple Silicon GPU acceleration
-    "mlx>=0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    # Upper-bound: paged_ops.cpp uses mlx/backend/metal/device.h (private API).
+    # Bump after verifying the JIT build against the new MLX minor release.
+    "mlx>=0.31.0,<0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.31.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "mlx-vlm>=0.4.0; platform_system == 'Darwin' and platform_machine == 'arm64'",  # Vision-language model support
     # Model loading and weights
