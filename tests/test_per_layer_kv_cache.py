@@ -273,12 +273,12 @@ class TestCachePolicyPerLayerBytes:
 
         with pytest.raises(
             NotImplementedError,
-            match="Per-layer KV shapes with TurboQuant are not yet implemented",
+            match="TurboQuant with per-layer KV shapes is not yet supported",
         ):
             runner.validate_paged_attention_support()
 
         with pytest.raises(
             NotImplementedError,
-            match="Per-layer KV shapes with TurboQuant are not yet implemented",
+            match="TurboQuant with per-layer KV shapes is not yet supported",
         ):
             runner.get_kv_cache_spec()
