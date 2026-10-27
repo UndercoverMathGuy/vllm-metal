@@ -173,6 +173,10 @@ class _AttentionBatch:
     max_seq_len: int
     # KV-tile counts for the NAX pipeline choice (dequantized prefill only).
     nax_work: NaxTileWork | None = None
+    # This batch's leading decode/verification query tokens and their longest
+    # segment (PagedAttentionContext.decode_query_tokens); -1 / 0 unknown.
+    decode_query_tokens: int = -1
+    max_decode_query_len: int = 0
 
 
 @dataclass(frozen=True, eq=False)
@@ -325,6 +329,14 @@ def _turboquant_prefill_plan(
     fallback_ids = [i for i in range(len(lengths)) if i not in selected]
     query_order: list[int] = []
 
+    def decode_rows(ids: list[int]) -> tuple[int, int]:
+        # Decode segments lead the batch, so they stay a prefix of any ordered
+        # subset of it.
+        if ctx.decode_query_tokens < 0:
+            return -1, 0
+        decode = [lengths[i] for i in ids if cu_seqlens[i] < ctx.decode_query_tokens]
+        return sum(decode), max(decode, default=0)
+
     def batch(ids: list[int], tables: mx.array) -> _AttentionBatch:
         if not fallback_ids:
             # The whole batch keeps its original query order and metadata.
@@ -335,6 +347,7 @@ def _turboquant_prefill_plan(
                 meta.cu_seqlens_q,
                 meta.max_seq_len,
                 nax_tile_work(cu_seqlens, ctx.context_lens),
+                *decode_rows(ids),
             )
         indices = [q for i in ids for q in range(cu_seqlens[i], cu_seqlens[i + 1])]
         query_order.extend(indices)
@@ -349,6 +362,7 @@ def _turboquant_prefill_plan(
             mx.array(cu, dtype=mx.int32),
             max(kv_lens),
             nax_tile_work(cu, kv_lens),
+            *decode_rows(ids),
         )
 
     tables = mx.array([row + [0] * (table_width - len(row)) for row in rows], mx.int32)

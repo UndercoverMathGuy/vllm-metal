@@ -83,6 +83,12 @@ class PagedAttentionContext:
     # Number of query rows contributed by the decode prefix. This differs from
     # ``num_decode_requests`` for speculative verification windows.
     num_decode_tokens: int = 0
+    # Leading query tokens that are decode or verification rows, and their
+    # longest segment, for the unified attention route; -1 / 0 when the
+    # context builder does not know (that route then leaves mixed batches to
+    # the established kernels rather than guess).
+    decode_query_tokens: int = -1
+    max_decode_query_len: int = 0
     # Longest decode context length after this step's tokens land, i.e. the
     # maximum over decode rows of (pre-step cached KV length from
     # ``seq_lens`` + query rows scheduled this step). Not the pre-step
@@ -343,6 +349,8 @@ def prepare_grouped(
             offsets=offsets,
             num_decode_requests=len(decode_requests),
             num_decode_tokens=num_decode_tokens,
+            decode_query_tokens=num_decode_tokens,
+            max_decode_query_len=max_decode_window,
             max_decode_context_len=max_decode_context_len,
             # Window routing applies only to pure-verification batches. Any
             # prefill segment keeps the whole batch on a prefill kernel (tiled,

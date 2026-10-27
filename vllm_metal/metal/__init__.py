@@ -67,6 +67,7 @@ def paged_attention_capabilities(ops: ModuleType) -> dict[str, bool]:
             "gqa_mixed_decode_plan",
             "nax_split_hint",
             "nax_prefill_split_hint",
+            "unified_decode_rows",
         )
     }
 
@@ -128,6 +129,16 @@ def _build_rope_source() -> str:
     return _read_v2_metal_source("rope.metal")
 
 
+def _build_unified_paged_attention_source() -> str:
+    """Concatenate utils + turboquant + the unified paged attention kernel."""
+    parts = [
+        _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "pagedattention_unified.metal"),
+    ]
+    return "\n".join(parts)
+
+
 def _build_nax_source() -> str:
     """Read the self-contained NAX prefill attention source."""
     return _read_metal_source(_KERNELS_V2_DIR / "pagedattention_nax.metal")
@@ -168,6 +179,22 @@ def _try_init_nax_library(
             exc,
         )
         return False
+
+
+def _init_unified_attention(
+    mod: ModuleType, *, requested: bool, nax_ready: bool
+) -> None:
+    """Route attention through the unified kernel when requested, except where
+    NAX is active: NAX machines keep the established kernels for every batch."""
+    enabled = requested and not nax_ready
+    mod.set_unified_attention_enabled(enabled)
+    if enabled:
+        logger.info("Unified packed-GQA paged attention enabled")
+    elif requested:
+        logger.warning(
+            "VLLM_METAL_UNIFIED_ATTENTION is ignored: NAX prefill attention is "
+            "active, so the established kernels serve attention"
+        )
 
 
 def metal_mla_paged_attention(
@@ -324,6 +351,7 @@ def get_ops() -> ModuleType:
         mod.init_v2_library(_build_v2_paged_attention_source())
         mod.init_gdn_library(_build_gdn_source())
         mod.init_mla_library(_build_mla_paged_attention_source())
+        mod.init_unified_library(_build_unified_paged_attention_source())
     else:
         from vllm_metal.metal.build import (
             METALLIB_NAMES,
@@ -350,6 +378,9 @@ def get_ops() -> ModuleType:
     )
     if nax_ready:
         logger.info("NAX prefill attention kernels loaded (M5 tensor units)")
+    _init_unified_attention(
+        mod, requested=envs.VLLM_METAL_UNIFIED_ATTENTION, nax_ready=nax_ready
+    )
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")

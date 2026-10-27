@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 import vllm_metal.envs as envs
-from vllm_metal.metal import _try_init_nax_library
+from vllm_metal.metal import _init_unified_attention, _try_init_nax_library
 
 
 def _ops(*, supported: bool = True, load_error: Exception | None = None):
@@ -93,3 +93,25 @@ def test_optional_load_failure_warns_and_keeps_fallback(
         prebuilt_path=lib,
     )
     assert "using the non-NAX fallback" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("requested", "nax_ready", "enabled"),
+    [(True, False, True), (True, True, False), (False, False, False)],
+)
+def test_unified_attention_never_runs_where_nax_is_active(
+    requested: bool, nax_ready: bool, enabled: bool, monkeypatch
+) -> None:
+    ops = SimpleNamespace(set_unified_attention_enabled=Mock())
+    # vLLM's logging config can stop propagation to caplog in a full run.
+    logger = Mock()
+    monkeypatch.setattr("vllm_metal.metal.logger", logger)
+
+    _init_unified_attention(
+        ops,  # type: ignore[arg-type]
+        requested=requested,
+        nax_ready=nax_ready,
+    )
+
+    ops.set_unified_attention_enabled.assert_called_once_with(enabled)
+    assert logger.warning.called is (requested and nax_ready)

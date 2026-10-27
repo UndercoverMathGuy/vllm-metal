@@ -30,7 +30,7 @@ constexpr int kPartitionSize = VLLM_METAL_PARTITION_SIZE;
 // Process-wide diagnostic for tests; not a per-request trace or routing input.
 enum class PagedDispatch {
   None, GqaDecode, PerToken, SplitKv, Window, WindowSplitKv, NaxPrefill,
-  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode, Count
+  TiledPrefill, MixedPrefillDecode, MixedNaxPrefillDecode, Unified, Count
 };
 using hardware::detected_gpu_core_count;
 using hardware::gpu_core_count;
@@ -142,7 +142,36 @@ int gqa_decode_plan_for_lengths(
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
     const std::string& gpu_arch = "", int max_seq_len = 0);
 void init_v2_library(const std::string& v2_src);
+void init_unified_library(const std::string& src);
+// Process-wide switch (VLLM_METAL_UNIFIED_ATTENTION): route supported
+// paged_attention_primitive batches through the unified kernel.
+extern bool unified_attention_enabled_;
+// Encode the unified kernel into `out` (already allocated) when it supports
+// the dtypes, head size and page size and can tell decode/verification rows
+// from prefill rows (window hint, decode_query_tokens >= 0, or else only
+// one-token segments); false leaves the caller's route.
+bool dispatch_unified_paged_attention_if_supported(
+    array& out, const array& query, const array& key_cache,
+    const array& value_cache, const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q, const array* sinks, const array* key_scale,
+    const array* value_scale, const array* key_zero, const array* centroids,
+    int num_kv_heads, float scale, float softcap, int block_size,
+    int max_seq_len, int sliding_window, int max_query_len,
+    int window_seqlen_q, int decode_query_tokens, int max_decode_query_len,
+    bool use_turboquant, int k_bits, int v_bits, Stream s);
 void init_library_path(const std::string& name, const std::string& path);
+array unified_paged_attention_primitive_fn(
+    const array& query, const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale, float softcap, const array& block_tables,
+    const array& seq_lens, const array& cu_seqlens_q, int block_size,
+    int max_seq_len, int sliding_window, int max_query_len,
+    const array* sinks, int partition,
+    const std::optional<std::tuple<std::string, int, int>>& config = std::nullopt,
+    const array* key_scale_cache = nullptr,
+    const array* value_scale_cache = nullptr,
+    const array* key_zero_cache = nullptr, const array* v_centroids = nullptr,
+    const std::string& quant_type = "", int v_bits = 3,
+    int num_decode_tokens = -1);
 void init_nax_library(const std::string& nax_src);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
@@ -166,7 +195,8 @@ array paged_attention_primitive_fn(
     int max_decode_context_len = 0, bool gqa_disabled = false,
     int gqa_test_partition = 0,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
-    int nax_split_hint = -1, int nax_prefill_split_hint = -1);
+    int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+    int decode_query_tokens = -1, int max_decode_query_len = 0);
 std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,

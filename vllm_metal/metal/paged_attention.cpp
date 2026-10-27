@@ -1293,7 +1293,8 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
       int num_decode_tokens = 0, int max_decode_context_len = 0,
       bool gqa_disabled = false, int gqa_test_partition = 0,
       const GqaDecodeLengthPlan& gqa_length_plan = {},
-      int nax_split_hint = -1, int nax_prefill_split_hint = -1)
+      int nax_split_hint = -1, int nax_prefill_split_hint = -1,
+      int decode_query_tokens = -1, int max_decode_query_len = 0)
       : UnaryPrimitive(stream),
         num_kv_heads_(num_kv_heads), scale_(scale), softcap_(softcap),
         block_size_(block_size), max_seq_len_(max_seq_len),
@@ -1306,7 +1307,9 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         max_decode_context_len_(max_decode_context_len),
         gqa_disabled_(gqa_disabled), gqa_test_partition_(gqa_test_partition),
         gqa_length_plan_(gqa_length_plan), nax_split_hint_(nax_split_hint),
-        nax_prefill_split_hint_(nax_prefill_split_hint) {}
+        nax_prefill_split_hint_(nax_prefill_split_hint),
+        decode_query_tokens_(decode_query_tokens),
+        max_decode_query_len_(max_decode_query_len) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error(
@@ -1329,6 +1332,24 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
     const array* vc = use_turboquant_ ? &inputs[9] : nullptr;
     const array* sk = use_sinks_ ? &inputs[6] : nullptr;
     const array* mp = use_mm_prefix_ ? &inputs[use_sinks_ ? 7 : 6] : nullptr;
+    // The private GQA test entry pins its kernel; it never takes this route.
+    if (unified_attention_enabled_ && mp == nullptr && gqa_test_partition_ == 0) {
+      // The unified kernel needs only a bound on segment lengths: 1 for
+      // decode, the verification window, else the whole batch.
+      const int total_q = static_cast<int>(inputs[0].shape(0));
+      const int num_seqs = static_cast<int>(inputs[5].shape(0)) - 1;
+      const int max_query_len = window_seqlen_q_ > 1 ? window_seqlen_q_
+          : total_q == num_seqs ? 1 : total_q;
+      if (dispatch_unified_paged_attention_if_supported(
+              out, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4],
+              inputs[5], sk, ks, vs, kz, vc, num_kv_heads_, scale_, softcap_,
+              block_size_, max_seq_len_, sliding_window_, max_query_len,
+              window_seqlen_q_, decode_query_tokens_, max_decode_query_len_,
+              use_turboquant_, k_bits_, v_bits_, stream())) {
+        record_paged_dispatch(PagedDispatch::Unified);
+        return;
+      }
+    }
     dispatch_paged_attention_v2_online(
         out,
         inputs[0],               // query
@@ -1365,7 +1386,9 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
         && rhs->gqa_test_partition_ == gqa_test_partition_
         && rhs->gqa_length_plan_ == gqa_length_plan_
         && rhs->nax_split_hint_ == nax_split_hint_
-        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_;
+        && rhs->nax_prefill_split_hint_ == nax_prefill_split_hint_
+        && rhs->decode_query_tokens_ == decode_query_tokens_
+        && rhs->max_decode_query_len_ == max_decode_query_len_;
   }
 
  private:
@@ -1389,6 +1412,10 @@ class PagedAttentionPrimitive : public UnaryPrimitive {
   GqaDecodeLengthPlan gqa_length_plan_;
   int nax_split_hint_;
   int nax_prefill_split_hint_;
+  // Unified route only: the leading decode/verification query tokens and
+  // their longest segment (-1 / 0: unknown).
+  int decode_query_tokens_;
+  int max_decode_query_len_;
 };
 
 array paged_attention_primitive_fn(
@@ -1411,11 +1438,18 @@ array paged_attention_primitive_fn(
     int max_decode_context_len, bool gqa_disabled,
     int gqa_test_partition,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-    int nax_split_hint, int nax_prefill_split_hint) {
+    int nax_split_hint, int nax_prefill_split_hint, int decode_query_tokens,
+    int max_decode_query_len) {
   if (nax_split_hint < -1 || nax_split_hint > 1)
     throw std::invalid_argument("nax_split_hint must be -1, 0 or 1");
   if (nax_prefill_split_hint < -1 || nax_prefill_split_hint > 1)
     throw std::invalid_argument("nax_prefill_split_hint must be -1, 0 or 1");
+  if (decode_query_tokens < -1 ||
+      decode_query_tokens > static_cast<int>(query.shape(0)) ||
+      max_decode_query_len < 0)
+    throw std::invalid_argument(
+        "decode_query_tokens must be -1 (unknown) or the number of leading "
+        "decode/verification query tokens, and max_decode_query_len >= 0");
   const auto lengths =
       gqa_length_plan ? *gqa_length_plan : GqaDecodeLengthPlan{};
   if (gqa_length_plan) {
@@ -1575,7 +1609,8 @@ array paged_attention_primitive_fn(
       use_turboquant, k_bits, v_bits, window_seqlen_q, sinks != nullptr,
       mm_prefix_ranges != nullptr, num_decode_requests, num_decode_tokens,
       max_decode_context_len, gqa_disabled, gqa_test_partition, lengths,
-      nax_split_hint, nax_prefill_split_hint);
+      nax_split_hint, nax_prefill_split_hint, decode_query_tokens,
+      max_decode_query_len);
   std::vector<array> inputs = {query, key_cache, value_cache,
                                block_tables, seq_lens, cu_seqlens_q};
   if (use_turboquant) {

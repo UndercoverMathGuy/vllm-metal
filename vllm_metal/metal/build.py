@@ -29,6 +29,7 @@ _SRC = _THIS_DIR / "mlx_bindings.cpp"
 _PAGED_ATTENTION = _THIS_DIR / "paged_attention.cpp"
 _GDN = _THIS_DIR / "gdn.cpp"
 _MLA = _THIS_DIR / "mla.cpp"
+_UNIFIED = _THIS_DIR / "unified_attention.cpp"
 _INTERNAL = _THIS_DIR / "ops_internal.h"
 _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
 _KERNELS = _THIS_DIR / "paged_attention_kernels.h"
@@ -57,7 +58,13 @@ _HASH = _stamp_path(_OUT)
 _MLX_VERSION = _THIS_DIR / "_paged_ops.mlx-version"
 
 # Required precompiled shader libraries bundled in every wheel.
-METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern", "rope_kern")
+METALLIB_NAMES = (
+    "paged_attention_v2_kern",
+    "gdn_kern",
+    "paged_mla_kern",
+    "rope_kern",
+    "paged_attention_unified_kern",
+)
 
 # Kept outside METALLIB_NAMES because wheels built with older SDKs omit it.
 NAX_METALLIB_NAME = "paged_attention_nax_kern"
@@ -150,6 +157,7 @@ def _metallib_source(name: str) -> str:
         _build_mla_paged_attention_source,
         _build_nax_source,
         _build_rope_source,
+        _build_unified_paged_attention_source,
         _build_v2_paged_attention_source,
     )
 
@@ -159,6 +167,7 @@ def _metallib_source(name: str) -> str:
         "paged_mla_kern": _build_mla_paged_attention_source,
         NAX_METALLIB_NAME: _build_nax_source,
         "rope_kern": _build_rope_source,
+        "paged_attention_unified_kern": _build_unified_paged_attention_source,
     }
     return builders[name]()
 
@@ -404,6 +413,7 @@ def _build_spec() -> _BuildSpec:
         str(_PAGED_ATTENTION),
         str(_GDN),
         str(_MLA),
+        str(_UNIFIED),
         str(_MLX_PATCH),
         str(_DEVICE_SRC),
         "-o",
@@ -437,6 +447,7 @@ def _input_hash(spec: _BuildSpec) -> str:
         _PAGED_ATTENTION,
         _GDN,
         _MLA,
+        _UNIFIED,
         _INTERNAL,
         _MLX_PATCH,
         _KERNELS,

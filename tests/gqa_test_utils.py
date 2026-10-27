@@ -101,8 +101,10 @@ def _grouped_paged_reference(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float = 0.0,
+    compute_dtype: mx.Dtype = mx.float32,
 ) -> mx.array:
-    """FP32 attention without repeating K/V for each grouped query head.
+    """FP32 (or ``compute_dtype``) attention without repeating K/V for each
+    grouped query head.
 
     Fold the query-token and GQA-group axes into a matrix row axis. Each KV
     head then owns one ordinary QK/PV matrix product, so the long-context reference
@@ -128,18 +130,18 @@ def _grouped_paged_reference(
             keys = (
                 key_cache[pages]
                 .reshape(-1, kv_heads, head_size)[:kv_len]
-                .astype(mx.float32)
+                .astype(compute_dtype)
                 .transpose(1, 0, 2)
             )
             values = (
                 value_cache[pages]
                 .reshape(-1, kv_heads, head_size)[:kv_len]
-                .astype(mx.float32)
+                .astype(compute_dtype)
                 .transpose(1, 0, 2)
             )
             queries = (
                 query[offset : offset + query_len]
-                .astype(mx.float32)
+                .astype(compute_dtype)
                 .reshape(query_len, kv_heads, group, head_size)
                 .transpose(1, 0, 2, 3)
                 .reshape(kv_heads, query_len * group, head_size)

@@ -158,6 +158,22 @@ class _KernelMetadata:
     tq_prefill_workspace_bytes: int = 0
 
 
+def _decode_row_kwargs(
+    ctx: PagedAttentionContext, batch: _AttentionBatch | None = None
+) -> dict[str, int]:
+    """Leading decode/verification rows of one primitive call (the whole
+    batch, or a TurboQuant sub-batch), for the unified route's grid choice."""
+    if ctx.paged_native_capabilities is None:
+        ctx.paged_native_capabilities = paged_attention_capabilities(get_ops())
+    if not ctx.paged_native_capabilities["unified_decode_rows"]:
+        return {}
+    source = ctx if batch is None else batch
+    return {
+        "decode_query_tokens": source.decode_query_tokens,
+        "max_decode_query_len": source.max_decode_query_len,
+    }
+
+
 def _kernel_metadata(
     ctx: PagedAttentionContext,
     group_index: int | None,
@@ -892,6 +908,9 @@ def sdpa_forward(
                 quant_type=kv_cache.k_quant,
                 v_bits=kv_cache.v_bits,
                 window_seqlen_q=ctx.verify_window_q,
+                **_decode_row_kwargs(
+                    ctx, batch if isinstance(batch, _AttentionBatch) else None
+                ),
                 **mm_kwargs,
             )
 
@@ -981,6 +1000,7 @@ def sdpa_forward(
                 **nax_split_kwargs(
                     ctx.paged_native_capabilities, batch.nax_work, q_3d.shape[2]
                 ),
+                **_decode_row_kwargs(ctx, batch),
             )
             if plan.fallback is not None:
                 fallback = plan.fallback
@@ -1020,6 +1040,7 @@ def sdpa_forward(
                 num_decode_tokens=ctx.num_decode_tokens,
                 max_decode_context_len=ctx.max_decode_context_len,
             )
+        paged_kwargs.update(_decode_row_kwargs(ctx))
         num_decode = ctx.num_decode_requests
         ordinary_decode_rows = (
             not ctx.gqa_disabled

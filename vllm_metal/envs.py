@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_DISABLE_GQA_DECODE: bool = False
+    VLLM_METAL_UNIFIED_ATTENTION: bool = False
     VLLM_METAL_TQ_PREFILL: str = "auto"
     VLLM_METAL_TQ_PREFILL_MAX_MIB: int | str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
@@ -191,6 +192,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-token / split-KV kernels. Mainly a benchmarking/A-B escape
     # hatch so controlled comparisons can run under the server topology.
     "VLLM_METAL_DISABLE_GQA_DECODE": _bool("VLLM_METAL_DISABLE_GQA_DECODE", False),
+    # Experimental: route supported paged attention (float32/float16/bfloat16
+    # or TurboQuant KV, head size 64/128/256, kernel block 8/16/32) through the
+    # unified packed-GQA kernel for decode, verification windows and prefill.
+    # Ignored where NAX is active: those machines keep the established kernels.
+    "VLLM_METAL_UNIFIED_ATTENTION": _bool("VLLM_METAL_UNIFIED_ATTENTION", False),
     # TQ materialized prefill: auto enables only when NAX is available;
     # 1 explicitly opts into tiled prefill on older GPUs, 0 disables it.
     "VLLM_METAL_TQ_PREFILL": _choice("VLLM_METAL_TQ_PREFILL", "auto", TQ_PREFILL_MODES),

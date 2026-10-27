@@ -191,6 +191,7 @@ NB_MODULE(_paged_ops, m) {
     caps["gqa_mixed_decode_plan"] = true;
     caps["nax_split_hint"] = true;
     caps["nax_prefill_split_hint"] = true;
+    caps["unified_decode_rows"] = true;
     return caps;
   }, "Capabilities of the public paged attention interface. Private test "
      "kernels do not imply an enabled production route.");
@@ -420,7 +421,8 @@ NB_MODULE(_paged_ops, m) {
            int num_decode_tokens,
            int max_decode_context_len, bool gqa_disabled,
            const std::optional<GqaDecodeLengthPlan>& gqa_length_plan,
-           int nax_split_hint, int nax_prefill_split_hint) {
+           int nax_split_hint, int nax_prefill_split_hint,
+           int decode_query_tokens, int max_decode_query_len) {
           return paged_attention_primitive_fn(
               query, key_cache, value_cache,
               num_kv_heads, scale, softcap,
@@ -431,7 +433,8 @@ NB_MODULE(_paged_ops, m) {
               window_seqlen_q, sinks, mm_prefix_ranges, num_decode_requests,
               num_decode_tokens, max_decode_context_len, gqa_disabled,
               0, gqa_length_plan, nax_split_hint,
-              nax_prefill_split_hint);
+              nax_prefill_split_hint, decode_query_tokens,
+              max_decode_query_len);
         },
         nb::arg("query"),
         nb::arg("key_cache"), nb::arg("value_cache"),
@@ -457,6 +460,8 @@ NB_MODULE(_paged_ops, m) {
         nb::arg("gqa_length_plan") = nb::none(),
         nb::arg("nax_split_hint") = -1,
         nb::arg("nax_prefill_split_hint") = -1,
+        nb::arg("decode_query_tokens") = -1,
+        nb::arg("max_decode_query_len") = 0,
         "Return a lazy paged attention array (read-only). Cache writes are handled "
         "by MLX-native scatter upstream.  window_seqlen_q must equal the "
         "longest cu_seqlens_q segment (validated when > 1); small "
@@ -487,7 +492,12 @@ NB_MODULE(_paged_ops, m) {
         "override describes only the remaining prefill sequences. "
         "Outputs are identical either way. For head_size 512, an effective "
         "hint of 1 selects two 256-column output slices; 0 or -1 keeps the "
-        "original loop.");
+        "original loop.  decode_query_tokens (the leading decode and "
+        "verification query tokens, -1 unknown) and max_decode_query_len "
+        "(their longest segment, 0 unknown) are read only by the unified "
+        "route (VLLM_METAL_UNIFIED_ATTENTION), which keeps those rows on its "
+        "decode grid at any window length and leaves a mixed batch that "
+        "omits them to the established kernels.");
 
   m.def(
       "last_nax_split_pipeline",
@@ -502,7 +512,7 @@ NB_MODULE(_paged_ops, m) {
         static constexpr const char* names[] = {
             "", "gqa_decode", "per_token_ps0", "per_token_ps512", "window_ps0",
             "window_ps512", "nax_prefill", "tiled_prefill", "mixed_prefill_decode",
-            "mixed_nax_prefill_decode"};
+            "mixed_nax_prefill_decode", "unified"};
         static_assert(std::size(names) == static_cast<size_t>(PagedDispatch::Count),
                       "PagedDispatch and its diagnostic names must stay in sync");
         return names[static_cast<size_t>(
@@ -511,7 +521,7 @@ NB_MODULE(_paged_ops, m) {
       "Dispatch family chosen by the most recent recorded paged_attention_primitive "
       "eval (\"gqa_decode\", \"per_token_ps0\", \"per_token_ps512\", "
       "\"window_ps0\", \"window_ps512\", \"nax_prefill\", "
-      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\"). "
+      "\"tiled_prefill\", \"mixed_prefill_decode\", \"mixed_nax_prefill_decode\", \"unified\"). "
       "Diagnostic surface for routing tests; empty "
       "when diagnostics are disabled, cleared or before the first recorded eval.");
 
@@ -528,6 +538,60 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_mla_library", &init_mla_library,
         nb::arg("src"),
         "JIT-compile the MLA paged attention Metal shader (RFC #360).");
+
+  m.def("set_unified_attention_enabled",
+        [](bool enabled) { unified_attention_enabled_ = enabled; },
+        nb::arg("enabled"),
+        "Route supported paged_attention_primitive batches through the unified "
+        "packed-GQA kernel (VLLM_METAL_UNIFIED_ATTENTION).");
+
+  m.def("init_unified_library", &init_unified_library,
+        nb::arg("src"),
+        "JIT-compile the unified packed-GQA paged attention Metal shader.");
+
+  m.def("unified_paged_attention_primitive",
+        [](const array& query, const array& key_cache, const array& value_cache,
+           int num_kv_heads, float scale, float softcap,
+           const array& block_tables, const array& seq_lens,
+           const array& cu_seqlens_q, int block_size, int max_seq_len,
+           int sliding_window, int max_query_len, const array* sinks,
+           int partition,
+           const std::optional<std::tuple<std::string, int, int>>& config,
+           const array* key_scale_cache, const array* value_scale_cache,
+           const array* key_zero_cache, const array* v_centroids,
+           const std::string& quant_type, int v_bits, int num_decode_tokens) {
+          return unified_paged_attention_primitive_fn(
+              query, key_cache, value_cache, num_kv_heads, scale, softcap,
+              block_tables, seq_lens, cu_seqlens_q, block_size, max_seq_len,
+              sliding_window, max_query_len, sinks, partition, config,
+              key_scale_cache, value_scale_cache, key_zero_cache, v_centroids,
+              quant_type, v_bits, num_decode_tokens);
+        },
+        nb::arg("query"), nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("num_kv_heads"), nb::arg("scale"), nb::arg("softcap"),
+        nb::arg("block_tables"), nb::arg("seq_lens"), nb::arg("cu_seqlens_q"),
+        nb::arg("block_size"), nb::arg("max_seq_len"),
+        nb::arg("sliding_window"), nb::arg("max_query_len"),
+        nb::arg("sinks").none() = nb::none(), nb::arg("partition") = -1,
+        nb::arg("config").none() = nb::none(),
+        nb::arg("key_scale_cache").none() = nb::none(),
+        nb::arg("value_scale_cache").none() = nb::none(),
+        nb::arg("key_zero_cache").none() = nb::none(),
+        nb::arg("v_centroids").none() = nb::none(),
+        nb::arg("quant_type") = "", nb::arg("v_bits") = 3,
+        nb::arg("num_decode_tokens") = -1,
+        "Return a lazy paged attention array from the unified packed-GQA "
+        "kernel. max_query_len bounds every cu_seqlens_q segment; partition "
+        "is -1 (auto), 0 (single pass) or the number of canonical partitions "
+        "per split-KV group of the direct grid (every choice gives the same "
+        "bits; the staged grid always runs a single pass); config "
+        "overrides the (\"direct\" | \"staged\", sg_m, tile_kv) grid, sg_m 0 "
+        "picking direct row simdgroups from the rows. A non-empty quant_type "
+        "reads TurboQuant caches (key/value/scale/zero caches plus "
+        "v_centroids). num_decode_tokens is the number of leading decode or "
+        "verification query tokens, which take the decode grid at any window "
+        "length; -1 counts only one-token segments as decode rows, so a "
+        "multi-token verification window must be declared.");
 
   m.def("mla_paged_attention_primitive", &mla_paged_attention_primitive_fn,
         nb::arg("q_nope"), nb::arg("q_pe"),
